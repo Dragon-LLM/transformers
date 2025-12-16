@@ -1467,16 +1467,6 @@ class ProcessorMixin(PushToHubMixin):
                 if "token_type_ids" in tokenizer.model_input_names:
                     tokenizer.model_input_names.remove("token_type_ids")
                 args.append(tokenizer)
-            elif "PixtralProcessor" in cls.__name__ and "tokenizer" in sub_processor_type:
-                from tokenizers import pre_tokenizers
-
-                from .models.llama import LlamaTokenizer
-
-                tokenizer = LlamaTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
-                tokenizer._tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
-                    [pre_tokenizers.ByteLevel(False), tokenizer._tokenizer.pre_tokenizer]
-                )
-                args.append(tokenizer)
             elif sub_processor_type in MODALITY_TO_AUTOPROCESSOR_MAPPING:
                 auto_processor_class = MODALITY_TO_AUTOPROCESSOR_MAPPING[sub_processor_type]
                 sub_processor = auto_processor_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
