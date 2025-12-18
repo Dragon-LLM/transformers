@@ -58,18 +58,21 @@ except ImportError:
 print(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
 
 # Gated DeltaNet backend selection
-try:
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-except ImportError:
-    logger.warning_once("Falling back to Torch implementation for Gated DeltaNet as flash-linear-attention module was not found.")
-    chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
+chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
+if torch.cuda.is_available():
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+    except ImportError:
+        logger.warning_once("Falling back to Torch implementation for Gated DeltaNet as flash-linear-attention module was not found.")
 
 # 1D short convolution backend selection
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    logger.warning_once("Falling back to Torch implementation for the short convolution as causal-conv1d module was not found.")
-    causal_conv1d_fn, causal_conv1d_update = None, None
+causal_conv1d_fn, causal_conv1d_update = None, None
+if torch.cuda.is_available():
+    try:
+        from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    except ImportError:
+        logger.warning_once("Falling back to Torch implementation for the short convolution as causal-conv1d module was not found.")
+
 
 class DragonHeadWiseRMSNorm(nn.Module):
     def __init__(self, n_heads, d_head, eps=1e-6):
@@ -470,6 +473,9 @@ class DragonAttention(nn.Module):
             softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
         )
 
+        if isinstance(attn_output, (tuple, list)):
+            attn_output = attn_output[0]
+
         if cache_params is not None and not self.reuse_kv:
             cache_params.trim(self.layer_idx)
 
@@ -593,7 +599,11 @@ class DragonDifferentialAttention(nn.Module):
                 v1 = v[:, :, :, :D//2]
                 v2 = v[:, :, :, D//2:]
                 o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)
+                if isinstance(o1, (tuple, list)):
+                    o1 = o1[0]
                 o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
+                if isinstance(o2, (tuple, list)):
+                    o2 = o2[0]
                 o = torch.cat([o1, o2], dim=-1)
                 return o
         elif self.attn_impl == "flex":
@@ -661,15 +671,13 @@ def torch_chunk_gated_delta_rule(
     v,
     g,
     beta,
-    scale=None,
     chunk_size=64,
     initial_state=None,
     output_final_state=False,
+    scale=None,
     use_qk_l2norm_in_kernel=False,
 ):
     initial_dtype = q.dtype
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
     if use_qk_l2norm_in_kernel:
         q = l2norm(q, dim=-1, eps=1e-6)
         k = l2norm(k, dim=-1, eps=1e-6)
@@ -677,15 +685,16 @@ def torch_chunk_gated_delta_rule(
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, beta, g)
     ]
 
-    batch_size, sequence_length, num_heads, k_head_dim = k.shape
+    batch_size, num_heads, sequence_length, k_head_dim = k.shape
     v_head_dim = v.shape[-1]
-    pad_size = (chunk_size - num_heads % chunk_size) % chunk_size
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
     q = F.pad(q, (0, 0, 0, pad_size))
     k = F.pad(k, (0, 0, 0, pad_size))
     v = F.pad(v, (0, 0, 0, pad_size))
     beta = F.pad(beta, (0, pad_size))
     g = F.pad(g, (0, pad_size))
-    tot_heads = num_heads + pad_size
+    total_sequence_length = sequence_length + pad_size
+    scale = 1 / (q.shape[-1] ** 0.5) if scale is None else scale
     q = q * scale
 
     v_beta = v * beta.unsqueeze(-1)
@@ -709,7 +718,7 @@ def torch_chunk_gated_delta_rule(
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
         if initial_state is None
         else initial_state.to(value)
     )
@@ -717,8 +726,8 @@ def torch_chunk_gated_delta_rule(
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1)
 
     # for each chunk
-    for i in range(0, tot_heads // chunk_size):
-        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = q[:, :, i], k[:, :, i], value[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
         v_new = v_i - v_prime
@@ -732,16 +741,14 @@ def torch_chunk_gated_delta_rule(
     if not output_final_state:
         last_recurrent_state = None
     core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
-    core_attn_out = core_attn_out[:, :, :num_heads]
+    core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
 
 def torch_recurrent_gated_delta_rule(
-    q, k, v, g, beta, scale, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
+    q, k, v, g, beta, initial_state, output_final_state, scale=None, use_qk_l2norm_in_kernel=False
 ):
     initial_dtype = q.dtype
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
     if use_qk_l2norm_in_kernel:
         q = l2norm(q, dim=-1, eps=1e-6)
         k = l2norm(k, dim=-1, eps=1e-6)
@@ -749,18 +756,19 @@ def torch_recurrent_gated_delta_rule(
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, beta, g)
     ]
 
-    batch_size, sequence_length, num_heads, k_head_dim = k.shape
+    batch_size, num_heads, sequence_length, k_head_dim = k.shape
     v_head_dim = v.shape[-1]
+    scale = 1 / (q.shape[-1] ** 0.5) if scale is None else scale
     q = q * scale
 
-    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(v)
+    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(v)
     last_recurrent_state = (
-        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(v)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(v)
         if initial_state is None
         else initial_state.to(v)
     )
 
-    for i in range(num_heads):
+    for i in range(sequence_length):
         q_t = q[:, :, i]
         k_t = k[:, :, i]
         v_t = v[:, :, i]
