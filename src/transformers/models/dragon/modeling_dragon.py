@@ -380,7 +380,12 @@ class DragonAttention(nn.Module):
             if not reuse_kv:
                 self.k_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon)
 
-        if ATTN_IMPL == "flex":
+        if config.attn_implementation == "auto":
+            self.attn_impl = ATTN_IMPL
+        else:
+            self.attn_impl = config.attn_implementation
+
+        if self.attn_impl == "flex":
             # score mod (for softcap)
             def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
                 if self.config.softcap_local_attn > 0.:
@@ -441,18 +446,18 @@ class DragonAttention(nn.Module):
         # attention computation.
         wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
 
-        if ATTN_IMPL == "eager":
+        if self.attn_impl == "eager":
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
-        elif ATTN_IMPL == "flex":
+        elif self.attn_impl == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
-        elif ATTN_IMPL == "fa2":
+        elif self.attn_impl == "fa2":
             attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-        elif ATTN_IMPL == "fa3":
+        elif self.attn_impl == "fa3":
             attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
         else:
-            raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
+            raise ValueError(f"Unknown ATTN_IMPL: {self.attn_impl}")
 
         attn_output = attention_interface(
             query_states.bfloat16(),
@@ -508,7 +513,12 @@ class DragonDifferentialAttention(nn.Module):
         self.lambda_q2 = torch.nn.Parameter(torch.zeros(self.head_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
         self.lambda_k2 = torch.nn.Parameter(torch.zeros(self.head_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
 
-        if ATTN_IMPL == "flex":
+        if config.diff_attn_implementation == "auto":
+            self.attn_impl = DIFF_ATTN_IMPL
+        else:
+            self.attn_impl = config.diff_attn_implementation
+
+        if self.attn_impl == "flex":
             # score mod (for softcap)
             def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
                 if self.config.softcap_global_attn > 0.:
@@ -564,9 +574,9 @@ class DragonDifferentialAttention(nn.Module):
         query1_states, query2_states = query_states[:, :, torch.arange(0, self.num_heads, 2)].contiguous(), query_states[:, :, torch.arange(1, self.num_heads, 2)].contiguous()
         key1_states, key2_states = key_states[:, :, torch.arange(0, self.num_key_value_heads, 2)].contiguous(), key_states[:, :, torch.arange(1, self.num_key_value_heads, 2)].contiguous()
     
-        if DIFF_ATTN_IMPL == "flex_head":
+        if self.attn_impl == "flex_head":
             diff_attention_interface = lambda q, k, v, wsize, **kw: flex_head_fa.flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-        elif DIFF_ATTN_IMPL == "fa2":
+        elif self.attn_impl == "fa2":
             def diff_attention_interface(q, k, v, wsize, **kw):
                 D = v.size(3)
                 v1 = v[:, :, :, :D//2]
@@ -575,7 +585,7 @@ class DragonDifferentialAttention(nn.Module):
                 o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
                 o = torch.cat([o1, o2], dim=-1)
                 return o
-        elif DIFF_ATTN_IMPL == "fa3":
+        elif self.attn_impl == "fa3":
             def diff_attention_interface(q, k, v, wsize, **kw):
                 D = v.size(3)
                 v1 = v[:, :, :, :D//2]
@@ -584,11 +594,11 @@ class DragonDifferentialAttention(nn.Module):
                 o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
                 o = torch.cat([o1, o2], dim=-1)
                 return o
-        elif DIFF_ATTN_IMPL == "flex":
+        elif self.attn_impl == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
-        elif DIFF_ATTN_IMPL == "eager":
+        elif self.attn_impl == "eager":
             diff_attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
 
         # attention_interface = lambda q, k, v, window_size, **kw: eager_attention_forward(q, k, v, window_size=(window_size, 0), **kw)
@@ -820,10 +830,29 @@ class DragonGatedDeltaNet(nn.Module):
         self.conv_dim = 2*self.key_dim+self.value_dim
         self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
 
-        self.causal_conv1d_fn = causal_conv1d_fn
-        self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
-        self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
+        if config.causal_conv_implementation == "auto":
+            self.causal_conv1d_fn = causal_conv1d_fn
+            self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
+        elif config.causal_conv_implementation == "eager":
+            self.causal_conv1d_fn = None
+            self.causal_conv1d_update = torch_causal_conv1d_update
+        elif config.causal_conv_implementation == "causal_conv1d":
+            self.causal_conv1d_fn = causal_conv1d_fn
+            self.causal_conv1d_update = causal_conv1d_update
+        else:
+            raise ValueError(f"Unknown causal_conv_implementation: {config.causal_conv_implementation}")
+
+        if config.gdn_implementation == "auto":
+            self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+            self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
+        elif config.gdn_implementation == "eager":
+            self.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+            self.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
+        elif config.gdn_implementation == "fla":
+            self.chunk_gated_delta_rule = chunk_gated_delta_rule
+            self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
+        else:
+            raise ValueError(f"Unknown gdn_implementation: {config.gdn_implementation}")
 
     def forward(self,
                 hidden_states: torch.Tensor,

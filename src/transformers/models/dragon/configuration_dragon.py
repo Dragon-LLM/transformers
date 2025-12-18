@@ -127,6 +127,10 @@ class DragonConfig(PretrainedConfig):
         gdn_dt_init_floor=1e-4,
         gdn_A_init_range=(1, 16),
         old_lns=False,
+        attn_implementation: str = "auto", # "auto" | "eager" | "fa2" | "fa3" | "flex"
+        diff_attn_implementation: str = "auto", # "auto" | "eager" | "flex_head" | "fa2" | "fa3" | "flex"
+        causal_conv_implementation: str = "auto", # "auto" | "eager" | "causal_conv1d"
+        gdn_implementation: str = "auto", # "auto" | "eager" | "fla"
         **kwargs,
     ):
 
@@ -192,6 +196,11 @@ class DragonConfig(PretrainedConfig):
         self.auto_map.setdefault("AutoConfig", "configuration_dragon.DragonConfig")
         self.auto_map.setdefault("AutoModel", "modeling_dragon.DragonModel")
         self.auto_map.setdefault("AutoModelForCausalLM", "modeling_dragon.DragonForCausalLM")
+
+        self.attn_implementation = attn_implementation
+        self.diff_attn_implementation = diff_attn_implementation
+        self.causal_conv_implementation = causal_conv_implementation
+        self.gdn_implementation = gdn_implementation
 
 DragonConfig.register_for_auto_class("AutoConfig")
 __all__ = ["DragonConfig"]
