@@ -191,16 +191,15 @@ class DragonConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-        # TODO: better way to handle those?
         self.auto_map = dict(getattr(self, "auto_map", {}))
         self.auto_map.setdefault("AutoConfig", "configuration_dragon.DragonConfig")
         self.auto_map.setdefault("AutoModel", "modeling_dragon.DragonModel")
         self.auto_map.setdefault("AutoModelForCausalLM", "modeling_dragon.DragonForCausalLM")
 
-        self.attn_implementation = attn_implementation
-        self.diff_attn_implementation = diff_attn_implementation
-        self.causal_conv_implementation = causal_conv_implementation
-        self.gdn_implementation = gdn_implementation
+        self.attn_implementation = attn_implementation or "auto"
+        self.diff_attn_implementation = diff_attn_implementation or "auto"
+        self.causal_conv_implementation = causal_conv_implementation or "auto"
+        self.gdn_implementation = gdn_implementation or "auto"
 
 DragonConfig.register_for_auto_class("AutoConfig")
 __all__ = ["DragonConfig"]
