@@ -543,7 +543,7 @@ MODEL_NAMES_MAPPING = OrderedDict[str, str](
         ("cvt", "CvT"),
         ("cwm", "Code World Model (CWM)"),
         ("d_fine", "D-FINE"),
-        ("dragon", "Dragon")
+        ("dragon", "Dragon"),
         ("dab-detr", "DAB-DETR"),
         ("dac", "DAC"),
         ("data2vec-audio", "Data2VecAudio"),
