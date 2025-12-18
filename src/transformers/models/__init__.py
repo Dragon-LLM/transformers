@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from .cvt import *
     from .cwm import *
     from .d_fine import *
+    from .dragon import *
     from .dab_detr import *
     from .dac import *
     from .data2vec import *
